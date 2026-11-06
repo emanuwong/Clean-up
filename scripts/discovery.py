@@ -4,7 +4,6 @@ import argparse
 import csv
 import datetime as dt
 import json
-import re
 import os
 from pathlib import Path
 import subprocess
@@ -109,11 +108,28 @@ def scan(profile, region, rows, errors):
                 {"engine": x.get("Engine"), "class": x.get("DBInstanceClass"),
                  "cluster": x.get("DBClusterIdentifier")})
 
+def last_metric_activity(profile, region, namespace, metric, dimensions, errors, days):
+    """Last positive CloudWatch metric datapoint in lookback; not proof of last actual use."""
+    end = dt.datetime.now(dt.timezone.utc)
+    start = end - dt.timedelta(days=days)
+    args = ["cloudwatch", "get-metric-statistics", "--namespace", namespace,
+            "--metric-name", metric, "--start-time", start.isoformat(),
+            "--end-time", end.isoformat(), "--period", "86400", "--statistics", "Sum",
+            "--dimensions"] + [f"Name={k},Value={v}" for k, v in dimensions.items()]
+    data = aws(profile, args, errors, region)
+    if data is None:
+        return None, "CloudWatch query failed"
+    positive = [p for p in data.get("Datapoints", []) if p.get("Sum", 0) > 0]
+    if not positive:
+        return None, f"No positive {metric} datapoints in last {days} days; not proof of inactivity"
+    return max(p["Timestamp"] for p in positive), f"Last positive daily {metric} datapoint within {days} days"
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--profile", required=True)
     parser.add_argument("--expected-account-id", required=True)
     parser.add_argument("--output-dir", default="reports")
+    parser.add_argument("--lookback-days", type=int, default=30, choices=range(1, 91), metavar="1-90")
     args = parser.parse_args()
     rows, errors = [], []
     identity = aws(args.profile, ["sts", "get-caller-identity"], errors)
@@ -157,6 +173,27 @@ def main():
             item["activity_note"] = "Hosted zone metadata has no last-query timestamp. Query logging must be configured separately."
         elif item["service"] in ("ec2", "rds", "load_balancer", "efs"):
             item["activity_note"] = "Last activity requires CloudWatch metric analysis and workload dependency review."
+    metric_configs = {
+        "ec2": ("AWS/EC2", "CPUUtilization", lambda x: {"InstanceId": x["id"]}),
+        "rds": ("AWS/RDS", "DatabaseConnections", lambda x: {"DBInstanceIdentifier": x["id"]}),
+        "efs": ("AWS/EFS", "TotalIOBytes", lambda x: {"FileSystemId": x["id"]}),
+        "load_balancer": ("AWS/ApplicationELB", "RequestCount",
+                          lambda x: {"LoadBalancer": x["arn"].split(":loadbalancer/")[-1]})
+    }
+    for item in rows:
+        if item["service"] not in metric_configs:
+            continue
+        if item["service"] == "rds" and item["type"] != "instance":
+            continue
+        if item["service"] == "load_balancer" and item["type"] != "application":
+            continue
+        namespace, metric, dimensions_fn = metric_configs[item["service"]]
+        observed, note = last_metric_activity(args.profile, item["region"], namespace,
+                                               metric, dimensions_fn(item), errors,
+                                               args.lookback_days)
+        item["last_activity"] = observed
+        item["activity_source"] = f"CloudWatch {namespace}/{metric} (daily)"
+        item["activity_note"] = note + "; metric-specific proxy, not exact last use."
     out = Path(args.output_dir)
     out.mkdir(parents=True, exist_ok=True)
     try:
