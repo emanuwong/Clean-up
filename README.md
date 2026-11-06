@@ -11,10 +11,10 @@ A generic, read-only inventory tool for AWS infrastructure.
 ## Run
 
 ```bash
-python3 scripts/discovery.py --profile audit-readonly --expected-account-id 123456789012 --lookback-days 30
+python3 scripts/discovery.py --lookback-days 30
 ```
 
-Authenticate manually before running the script. The script never starts an SSO login. The account ID above is a placeholder. Replace it with the intended AWS account ID.
+Authenticate manually before running the script. The script never starts an SSO login. It uses the active AWS CLI profile (AWS_PROFILE or default) and verifies that STS credentials are available. Optional flags: --profile PROFILE and --expected-account-id ACCOUNT_ID.
 
 ## Coverage
 
