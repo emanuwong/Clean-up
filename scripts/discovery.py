@@ -10,7 +10,9 @@ import subprocess
 import sys
 
 def aws(profile, args, errors, region=None):
-    cmd = ["aws", "--profile", profile, "--no-cli-pager"]
+    cmd = ["aws", "--no-cli-pager"]
+    if profile:
+        cmd += ["--profile", profile]
     if region:
         cmd += ["--region", region]
     cmd += args + ["--output", "json"]
@@ -126,14 +128,14 @@ def last_metric_activity(profile, region, namespace, metric, dimensions, errors,
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--profile", required=True)
-    parser.add_argument("--expected-account-id", required=True)
+    parser.add_argument("--profile", default=None)
+    parser.add_argument("--expected-account-id", default=None)
     parser.add_argument("--output-dir", default="reports")
     parser.add_argument("--lookback-days", type=int, default=30, choices=range(1, 91), metavar="1-90")
     args = parser.parse_args()
     rows, errors = [], []
     identity = aws(args.profile, ["sts", "get-caller-identity"], errors)
-    if not identity or identity.get("Account") != args.expected_account_id:
+    if not identity or not identity.get("Account") or (args.expected_account_id and identity.get("Account") != args.expected_account_id):
         print("Account verification failed; discovery aborted.", file=sys.stderr)
         return 2
     data = aws(args.profile, ["ec2", "describe-regions", "--all-regions"], errors)
