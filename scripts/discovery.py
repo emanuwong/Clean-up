@@ -4,6 +4,7 @@ import argparse
 import csv
 import datetime as dt
 import json
+import re
 import os
 from pathlib import Path
 import subprocess
@@ -29,7 +30,7 @@ def aws(profile, args, errors, region=None):
 def add(rows, service, region, kind, ident, arn="", name="", state="", tags=None, details=None):
     rows.append({"service": service, "region": region, "type": kind, "id": ident,
                  "arn": arn or "", "name": name or "", "state": state or "",
-                 "tags": tags or [], "details": details or {}})
+                 "tags": tags or [], "details": details or {}, "last_activity": None, "activity_source": "Not available from inventory APIs", "activity_note": "Requires service-specific usage evidence"})
 
 def scan(profile, region, rows, errors):
     d = aws(profile, ["secretsmanager", "list-secrets", "--include-planned-deletion"], errors, region)
@@ -141,6 +142,21 @@ def main():
             add(rows, "route53", "global", "private_hosted_zone", zid,
                 name=zone.get("Name"), details={"record_count": zone.get("ResourceRecordSetCount"),
                 "vpc_associations": (detail or {}).get("VPCs", [])})
+    # Usage evidence is intentionally conservative: no fabricated "last used" dates.
+    # Secrets Manager provides a last retrieval date (day granularity).
+    # EC2/RDS/ELB/EFS CloudWatch metrics show activity within a window, not exact last use.
+    # CloudTrail Event History is limited and does not cover all data-plane usage.
+    for item in rows:
+        if item["service"] == "secretsmanager":
+            item["last_activity"] = item["details"].get("last_accessed")
+            item["activity_source"] = "Secrets Manager LastAccessedDate (last retrieval, day granularity)"
+            item["activity_note"] = "No date does not prove unused; rotation or other operations are not represented."
+        elif item["service"] == "kms":
+            item["activity_note"] = "KMS DescribeKey has no reliable last-used timestamp. Validate CloudTrail and dependent services."
+        elif item["service"] == "route53":
+            item["activity_note"] = "Hosted zone metadata has no last-query timestamp. Query logging must be configured separately."
+        elif item["service"] in ("ec2", "rds", "load_balancer", "efs"):
+            item["activity_note"] = "Last activity requires CloudWatch metric analysis and workload dependency review."
     out = Path(args.output_dir)
     out.mkdir(parents=True, exist_ok=True)
     try:
@@ -160,7 +176,7 @@ def main():
     path = out / "inventory.csv"
     with path.open("w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=["service", "region", "type", "id",
-                                                    "arn", "name", "state", "tags", "details"])
+                                                    "arn", "name", "state", "tags", "last_activity", "activity_source", "activity_note", "details"])
         writer.writeheader()
         for row in rows:
             writer.writerow({k: json.dumps(v, default=str) if isinstance(v, (dict, list)) else v
@@ -169,7 +185,27 @@ def main():
         os.chmod(path, 0o600)
     except OSError:
         pass
+    # Flatten all observed tag keys into distinct CSV columns for filtering.
+    def tagdict(tags):
+        return {str(t.get("Key", "")): str(t.get("Value", "")) for t in tags if isinstance(t, dict) and t.get("Key")}
+    tag_keys = sorted({key for item in rows for key in tagdict(item["tags"])})
+    report_path = out / "resource-report.csv"
+    columns = ["service", "region", "type", "id", "arn", "name", "state",
+               "last_activity", "activity_source", "activity_note"] + ["tag:" + key for key in tag_keys]
+    with report_path.open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=columns)
+        writer.writeheader()
+        for item in rows:
+            tags = tagdict(item["tags"])
+            line = {key: item.get(key, "") for key in columns if not key.startswith("tag:")}
+            line.update({"tag:" + key: tags.get(key, "") for key in tag_keys})
+            writer.writerow(line)
+    try:
+        os.chmod(report_path, 0o600)
+    except OSError:
+        pass
     print("Resources:", len(rows), "API errors:", len(errors))
+    print("Report:", report_path)
     return 1 if errors else 0
 
 if __name__ == "__main__":
